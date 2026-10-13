@@ -57,6 +57,7 @@ func (c *mockCmd) setStartErr(err error) {
 }
 func (c *mockCmd) Wait() error                { return <-c.waitCh }
 func (c *mockCmd) Pid() int                   { return c.pid }
+func (c *mockCmd) SweepGroup()                {}
 func (c *mockCmd) SetDir(string)              {}
 func (c *mockCmd) SetEnv([]string)            {}
 func (c *mockCmd) SetStdout(io.Writer)        {}
