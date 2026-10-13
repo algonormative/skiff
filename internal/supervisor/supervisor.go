@@ -228,20 +228,13 @@ func (s *Supervisor) supervise(parentCtx context.Context, name string, cfg confi
 		// Sweep the process group for stragglers. Wrappers like `uv run X`
 		// fork a child that inherits the wrapper's pgid — when the wrapper
 		// exits (or is SIGTERM'd), the child gets re-parented to launchd
-		// but the pgid lingers as long as the child is alive. SIGKILL to
-		// -pgid catches them. With Setpgid:true the leader's pgid==pid,
-		// so we can just use pid here even after the leader is gone.
-		if isStopping {
-			_ = syscall.Kill(-pid, syscall.SIGTERM)
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) {
-				if err := syscall.Kill(-pid, syscall.Signal(0)); err != nil {
-					break // group is empty
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-		}
+		// but the pgid lingers as long as the child is alive. With
+		// Setpgid:true the leader's pgid==pid, so we can use pid here even
+		// after the leader is gone, and the group is this service's alone.
+		// Sweep on every exit, not only on Stop: a context cancel (daemon
+		// shutdown) or a crashed wrapper leaves the same stragglers, and
+		// the PID record is dropped below, so nothing else would reap them.
+		cmd.SweepGroup()
 
 		// Drop PID record now that the process is gone — keeps the file
 		// from accumulating stale entries while the supervise loop iterates.

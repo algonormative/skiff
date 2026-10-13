@@ -137,12 +137,12 @@ func (d *Daemon) handleUp(w http.ResponseWriter, r *http.Request) {
 				// Config changed, restart
 				_ = d.supervisor.Stop(name)
 			}
-			if err := d.supervisor.Start(ctx, name, svcCfg); err != nil {
+			if err := d.supervisor.Start(d.lifetimeCtx(), name, svcCfg); err != nil {
 				errors[name] = err.Error()
 			} else {
 				started = append(started, name)
 				if svcCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, name, svcCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), name, svcCfg.HealthCheck)
 				}
 			}
 		} else if cCfg, ok := d.cfg.Containers[name]; ok {
@@ -170,7 +170,7 @@ func (d *Daemon) handleUp(w http.ResponseWriter, r *http.Request) {
 					DependsOn:  cCfg.DependsOn,
 				})
 				if cCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, name, cCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), name, cCfg.HealthCheck)
 				}
 			}
 		} else {
@@ -342,9 +342,9 @@ func (d *Daemon) handleApply(w http.ResponseWriter, r *http.Request) {
 			d.state.RemoveResource(a.Resource)
 		case "start":
 			if svcCfg, ok := cfg.Services[a.Resource]; ok {
-				_ = d.supervisor.Start(ctx, a.Resource, svcCfg)
+				_ = d.supervisor.Start(d.lifetimeCtx(), a.Resource, svcCfg)
 				if svcCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, a.Resource, svcCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), a.Resource, svcCfg.HealthCheck)
 				}
 			} else if cCfg, ok := cfg.Containers[a.Resource]; ok {
 				rtCfg := containerToRuntimeConfig(a.Resource, cCfg)
@@ -359,15 +359,15 @@ func (d *Daemon) handleApply(w http.ResponseWriter, r *http.Request) {
 					DependsOn:  cCfg.DependsOn,
 				})
 				if cCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, a.Resource, cCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), a.Resource, cCfg.HealthCheck)
 				}
 			}
 		case "restart":
 			if svcCfg, ok := cfg.Services[a.Resource]; ok {
 				_ = d.supervisor.Stop(a.Resource)
-				_ = d.supervisor.Start(ctx, a.Resource, svcCfg)
+				_ = d.supervisor.Start(d.lifetimeCtx(), a.Resource, svcCfg)
 				if svcCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, a.Resource, svcCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), a.Resource, svcCfg.HealthCheck)
 				}
 			} else if cCfg, ok := cfg.Containers[a.Resource]; ok {
 				_ = d.runtime.Stop(ctx, a.Resource)
@@ -383,20 +383,14 @@ func (d *Daemon) handleApply(w http.ResponseWriter, r *http.Request) {
 					DependsOn:  cCfg.DependsOn,
 				})
 				if cCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, a.Resource, cCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), a.Resource, cCfg.HealthCheck)
 				}
 			}
 		}
 	}
 
-	// Reconcile schedules from the freshly loaded config. Use the daemon's
-	// long-lived runCtx — not the request ctx — so newly-spawned schedule
-	// goroutines outlive this HTTP call.
-	scheduleCtx := d.runCtx
-	if scheduleCtx == nil {
-		scheduleCtx = context.Background()
-	}
-	started, restarted, stopped := d.scheduler.Reconcile(scheduleCtx, cfg.Schedules)
+	// Reconcile schedules from the freshly loaded config.
+	started, restarted, stopped := d.scheduler.Reconcile(d.lifetimeCtx(), cfg.Schedules)
 	for _, n := range started {
 		actions = append(actions, action{Resource: n, Action: "start", Reason: "new schedule"})
 	}
@@ -448,7 +442,7 @@ func (d *Daemon) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 	if svcCfg, ok := d.cfg.Services[name]; ok {
 		_ = d.supervisor.Stop(name)
-		if err := d.supervisor.Start(ctx, name, svcCfg); err != nil {
+		if err := d.supervisor.Start(d.lifetimeCtx(), name, svcCfg); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -804,7 +798,7 @@ func (d *Daemon) handleScale(w http.ResponseWriter, r *http.Request) {
 					ConfigHash: config.Hash(newCfg),
 				})
 				if newCfg.HealthCheck != nil {
-					d.health.StartProbe(ctx, newName, newCfg.HealthCheck)
+					d.health.StartProbe(d.lifetimeCtx(), newName, newCfg.HealthCheck)
 				}
 			}
 			group.Names = append(group.Names, newName)
@@ -841,3 +835,16 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+// lifetimeCtx is the context for anything a request starts that must outlive
+// it: service supervisors, health probes and schedules. A request's own
+// r.Context() is cancelled when the handler returns, and exec.CommandContext
+// kills the child when its context ends, so a service started under it died
+// right after "skiff up/apply/restart" reported success (state "failed",
+// LastError "context canceled"). Short calls that finish inside the handler
+// (runtime Run/Stop/Exec) keep using the request context.
+func (d *Daemon) lifetimeCtx() context.Context {
+	if d.runCtx != nil {
+		return d.runCtx
+	}
+	return context.Background()
+}
